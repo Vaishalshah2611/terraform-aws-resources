@@ -1,0 +1,6 @@
+region      = "ca-central-1"
+project     = "myproject-dev"
+vpc_cidr    = "10.0.0.0/16"
+db_name     = "mydevdb"
+db_username = "devadmin"
+db_password = "devpassword123"
