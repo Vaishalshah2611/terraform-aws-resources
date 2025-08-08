@@ -23,42 +23,61 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       modules: ${{ steps.find.outputs.modules }}
+      has_modules: ${{ steps.find.outputs.has_modules }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - id: find
         name: Find changed module folders
+        shell: bash
         run: |
-          # For PRs, diff against base; for push, diff last commit.
+          set -euo pipefail
+
+          # Determine diff range
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin ${{ github.base_ref }} --depth=1
-            DIFF_RANGE="origin/${{ github.base_ref }}...HEAD"
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            DIFF_RANGE="$BASE_SHA...$HEAD_SHA"
           else
-            DIFF_RANGE="${{ github.sha }}~1...${{ github.sha }}"
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+            if [ -z "$BEFORE" ]; then
+              DIFF_RANGE="$AFTER~1...$AFTER"
+            else
+              DIFF_RANGE="$BEFORE...$AFTER"
+            fi
           fi
 
-          # List unique top-level directories under generated_modules that changed
-          CHANGED=$(git diff --name-only $DIFF_RANGE \
+          echo "Diff range: $DIFF_RANGE"
+
+          # Find unique top-level module dirs under generated_modules/
+          CHANGED=$(git diff --name-only "$DIFF_RANGE" \
             | awk -F/ '/^generated_modules\//{print $1"/"$2}' | sort -u)
 
-          # Fallback: if none detected, run nothing
           if [ -z "$CHANGED" ]; then
+            echo "No changed module dirs detected."
             echo '[]' > modules.json
+            echo "has_modules=false" >> "$GITHUB_OUTPUT"
           else
+            echo "Changed modules:"
             printf '[\n' > modules.json
-            FIRST=1
+            first=1
             for d in $CHANGED; do
-              # Expand to full folder (generated_modules/<module_id>)
               echo " - $d"
-              if [ $FIRST -eq 0 ]; then echo ',' >> modules.json; fi
-              FIRST=0
-              printf '  "%s"\n' "$d" >> modules.json
+              if [ $first -eq 0 ]; then printf ',\n' >> modules.json; fi
+              first=0
+              printf '  "%s"' "$d" >> modules.json
             done
-            printf ']\n' >> modules.json
+            printf '\n]\n' >> modules.json
+            echo "has_modules=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "modules=$(cat modules.json)" >> $GITHUB_OUTPUT
+
+          echo "modules=$(cat modules.json)" >> "$GITHUB_OUTPUT"
 
   plan:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && needs.discover.outputs.has_modules == 'true'
     needs: discover
     runs-on: ubuntu-latest
     strategy:
@@ -67,11 +86,15 @@ jobs:
         tfdir: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Export AWS creds (POC)
         run: |
           echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
           echo "AWS_REGION=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
@@ -79,7 +102,6 @@ jobs:
       - name: Terraform Init (S3 backend, no file)
         working-directory: ${{ matrix.tfdir }}
         run: |
-          # Derive a unique state key from the folder path
           KEY="${{ matrix.tfdir }}/terraform.tfstate"
           terraform init -input=false \
             -backend-config="bucket=${TF_BACKEND_BUCKET}" \
@@ -88,7 +110,7 @@ jobs:
             -backend-config="dynamodb_table=${TF_BACKEND_DDB_TABLE}" \
             -backend-config="encrypt=true"
 
-      - name: Terraform Validate
+      - name: Terraform Fmt & Validate
         working-directory: ${{ matrix.tfdir }}
         run: |
           terraform fmt -check
@@ -114,10 +136,15 @@ jobs:
             try { out = execSync('terraform show -no-color tfplan', { cwd: dir }).toString(); }
             catch { out = 'Failed to render plan.'; }
             const body = `### Terraform Plan (${dir})\n\`\`\`\n${out.substring(0,60000)}\n\`\`\``;
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
 
   apply:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.discover.outputs.has_modules == 'true'
     needs: discover
     runs-on: ubuntu-latest
     strategy:
@@ -126,11 +153,15 @@ jobs:
         tfdir: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Export AWS creds (POC)
         run: |
           echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
           echo "AWS_REGION=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
